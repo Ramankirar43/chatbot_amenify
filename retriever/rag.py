@@ -1,65 +1,103 @@
+import json
+import logging
 import os
 import re
-import json
-import faiss
+import threading
+from typing import Any
+
 import numpy as np
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
 
 load_dotenv()
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+logger = logging.getLogger(__name__)
+
+# Project root: .../retriever/rag.py -> parent -> parent
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(_PROJECT_ROOT, "data")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "amenify.index")
 METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
+
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "gemini-2.5-flash"  # Using latest available model
+LLM_MODEL = "gemini-2.5-flash"
 SIMILARITY_THRESHOLD = 1.35
 MAX_CONTEXT_BLOCKS = 3
 FAISS_PROBE_K = 20
 LLM_MAX_OUTPUT_TOKENS = 420
 
-# Configure Google Gemini
-api_key = os.getenv("GOOGLE_GEMINI_API_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
+# Lazy-loaded heavy resources (nothing loaded at import time)
+_resources_lock = threading.Lock()
+_embedding_model: Any = None
+_index: Any = None
+_metadata: list | None = None
+_resources_load_error: str | None = None
+_gemini_configured = False
 
-# Load embedding model
-print("Loading embedding model...")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
-index = None
-metadata = []
+def load_resources() -> str | None:
+    """
+    Load SentenceTransformer, FAISS index, and metadata once (thread-safe).
+    Configure Gemini API when a key is present.
+    Returns None on success, or a short user-facing error message on failure.
+    """
+    global _embedding_model, _index, _metadata, _resources_load_error, _gemini_configured
 
-def load_vector_db():
-    global index, metadata
-    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(METADATA_PATH):
-        index = faiss.read_index(FAISS_INDEX_PATH)
-        with open(METADATA_PATH, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-        if index.ntotal != len(metadata):
-            print(
-                f"WARNING: FAISS vectors ({index.ntotal}) != metadata entries ({len(metadata)}). "
-                "Run: python -m ingestion.ingest"
+    with _resources_lock:
+        if _resources_load_error is not None:
+            return _resources_load_error
+        if _embedding_model is not None and _index is not None and _metadata is not None:
+            return None  # already loaded successfully
+
+        if not os.path.isfile(FAISS_INDEX_PATH) or not os.path.isfile(METADATA_PATH):
+            _resources_load_error = (
+                "Knowledge base files are missing on the server. "
+                "Please ensure data/amenify.index and data/metadata.json are deployed."
             )
-        else:
-            print(f"Vector DB loaded ({index.ntotal} vectors).")
-    else:
-        print("WARNING: Vector DB files not found. Please run ingest.py first.")
+            return _resources_load_error
 
-def list_available_models():
-    """Debug: List available Gemini models"""
-    try:
-        models = genai.list_models()
-        print("\n=== Available Gemini Models ===")
-        for model in models:
-            print(f"  - {model.name}")
-        print("================================\n")
-    except Exception as e:
-        print(f"Could not list models: {e}")
+        try:
+            # Heavy imports only when needed (keeps uvicorn import + bind fast for Render)
+            import faiss
+            from sentence_transformers import SentenceTransformer
+
+            emb = SentenceTransformer(EMBEDDING_MODEL)
+            idx = faiss.read_index(FAISS_INDEX_PATH)
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            if idx.ntotal != len(meta):
+                logger.warning(
+                    "FAISS ntotal (%s) != metadata rows (%s); re-run ingestion.",
+                    idx.ntotal,
+                    len(meta),
+                )
+
+            api_key = os.getenv("GOOGLE_GEMINI_API_KEY")
+            if api_key and not _gemini_configured:
+                import google.generativeai as genai
+
+                genai.configure(api_key=api_key)
+                _gemini_configured = True
+
+            _embedding_model = emb
+            _index = idx
+            _metadata = meta
+            logger.info("RAG resources loaded (%s vectors).", idx.ntotal)
+            return None
+
+        except Exception:
+            logger.exception("Failed to load RAG resources")
+            _embedding_model = None
+            _index = None
+            _metadata = None
+            _resources_load_error = "The assistant could not start its search index. Please try again later."
+            return _resources_load_error
+
 
 def get_query_embedding(query: str) -> list[float]:
-    embedding = embedding_model.encode(query, convert_to_tensor=False)
+    if _embedding_model is None:
+        raise RuntimeError("Embedding model not loaded; call load_resources() first.")
+    embedding = _embedding_model.encode(query, convert_to_tensor=False)
     return embedding.tolist()
 
 
@@ -346,48 +384,57 @@ def retrieve_contexts(
     max_blocks: int | None = None,
 ):
     """Retrieve FAISS neighbors, filter by L2 distance, dedupe identical text."""
-    if index is None or not metadata:
+    if _index is None or _metadata is None or len(_metadata) == 0:
         return []
 
-    k = min(top_k or FAISS_PROBE_K, len(metadata))
+    k = min(top_k or FAISS_PROBE_K, len(_metadata))
     thr = SIMILARITY_THRESHOLD if threshold is None else threshold
     cap = max_blocks if max_blocks is not None else MAX_CONTEXT_BLOCKS
 
     q_emb = get_query_embedding(expand_query_for_embedding(query))
     q_emb_matrix = np.array([q_emb]).astype("float32")
 
-    distances, indices = index.search(q_emb_matrix, k)
+    distances, indices = _index.search(q_emb_matrix, k)
 
     contexts = []
     for dist, idx in zip(distances[0], indices[0]):
         if idx == -1 or not (dist < thr):
             continue
-        ctx = metadata[idx].copy()
+        ctx = _metadata[idx].copy()
         ctx["distance"] = float(dist)
         contexts.append(ctx)
-        print(f"Found context: distance={dist:.4f}, source={metadata[idx]['source'][:50]}")
+        logger.debug("Retrieved chunk distance=%.4f source=%s", dist, ctx.get("source", "")[:60])
 
     contexts = dedupe_contexts(contexts)[:cap]
 
-    if not contexts:
-        print(f"No contexts found. Best match distance: {distances[0][0]:.4f} (threshold: {thr})")
+    if not contexts and len(distances[0]):
+        logger.debug(
+            "No contexts under threshold; best_distance=%.4f threshold=%s",
+            float(distances[0][0]),
+            thr,
+        )
 
     return contexts
 
 async def generate_chat_stream(query: str, chat_history: list):
     """
     RAG Logic with Strict Anti-Hallucination.
-    Only answers from knowledge base; responds 'I don't know' if no good match found.
+    Heavy resources load only when a query needs retrieval (not for static intents).
     """
     static = handle_static_intent(query)
     if static:
         yield static
         return
 
+    load_err = load_resources()
+    if load_err:
+        yield load_err
+        return
+
     contexts = retrieve_contexts(query)
 
     if not contexts:
-        print(f"Query '{query}' has no matching contexts")
+        logger.debug("No contexts for query=%s", query[:80])
         yield "I don't know."
         return
 
@@ -411,6 +458,8 @@ Rules:
 Question: {query}"""
 
     try:
+        import google.generativeai as genai
+
         model = genai.GenerativeModel(LLM_MODEL)
         response = model.generate_content(
             system_prompt,
@@ -425,8 +474,12 @@ Question: {query}"""
             if chunk.text:
                 yield chunk.text
     except Exception as e:
-        print(f"Error generating response: {e}")
+        logger.exception("LLM generation failed")
         if contexts:
             yield polish_response(contexts, query)
         else:
             yield "I don't know."
+
+
+# Backwards compatibility (e.g. scripts); prefer load_resources()
+load_vector_db = load_resources

@@ -6,6 +6,3 @@ __pycache__/
 .env
 venv/
 
-# Data files (optional but recommended)
-data/*.index
-data/*.json
