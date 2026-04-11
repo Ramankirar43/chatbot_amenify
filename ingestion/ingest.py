@@ -4,31 +4,38 @@ import numpy as np
 import requests
 import faiss
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-EMBEDDING_MODEL = "text-embedding-3-small"
+# Configure local embeddings
+print("Loading embedding model...")
+model = SentenceTransformer('all-MiniLM-L6-v2')
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 URLS = [
     "https://www.amenify.in/",
     "https://www.amenify.in/home-interior-designing-services",
     "https://www.amenify.in/office-interiors-furnishing",
     "https://www.amenify.in/modular-kitchen-design-services",
-    "https://www.amenify.in/blog"
+    "https://www.amenify.in/furniture-store",
+    "https://www.amenify.in/blog",
 ]
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "amenify.index")
 METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
 
+
 def scrape_text_from_url(url: str) -> str:
     print(f"Scraping {url}...")
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         response.raise_for_status()
     except Exception as e:
         print(f"Error fetching {url}: {e}")
@@ -40,38 +47,42 @@ def scrape_text_from_url(url: str) -> str:
     for element in soup(["nav", "footer", "script", "style", "header", "noscript"]):
         element.decompose()
 
-    # Extract text from remaining tags
     text = soup.get_text(separator=' ', strip=True)
     return text
 
+
 def chunk_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> list[str]:
-    # Simple character-level chunking roughly equating to 200-400 tokens
-    # Average ~4 characters per token
     chunks = []
     start = 0
+
     while start < len(text):
         end = min(start + chunk_size, len(text))
-        # Optional: adjust end to nearest space to avoid breaking words
+
+        # avoid cutting words
         if end < len(text) and text[end] != ' ':
             space_idx = text.rfind(' ', start, end)
             if space_idx != -1:
                 end = space_idx
+
         chunk = text[start:end].strip()
-        if len(chunk) > 50: # Skip very small fragments
+
+        if len(chunk) > 50:
             chunks.append(chunk)
-        start = end - overlap
+
+        # FIX: prevent infinite/slow loop
+        start = max(end - overlap, start + 1)
+
     return chunks
 
+
 def get_embeddings(texts: list[str]) -> list[list[float]]:
-    response = client.embeddings.create(
-        input=texts,
-        model=EMBEDDING_MODEL
-    )
-    return [data.embedding for data in response.data]
+    embeddings = model.encode(texts, convert_to_tensor=False)
+    return embeddings.tolist()
+
 
 def ingest_data():
     os.makedirs(DATA_DIR, exist_ok=True)
-    
+
     all_chunks = []
     metadata = []
 
@@ -79,8 +90,12 @@ def ingest_data():
         page_text = scrape_text_from_url(url)
         if not page_text:
             continue
-        
+
         chunks = chunk_text(page_text)
+
+        # Keep more chunks (increased from 5 to 20 for richer data)
+        chunks = chunks[:20]
+
         for idx, chunk in enumerate(chunks):
             all_chunks.append(chunk)
             metadata.append({
@@ -94,16 +109,32 @@ def ingest_data():
         return
 
     print(f"Extracted {len(all_chunks)} chunks total. Generating embeddings...")
-    
-    # Process embeddings in batches to avoid rate limits / large payloads
-    batch_size = 100
+
+    # FIX: smaller batch size
+    batch_size = 20
     all_embeddings = []
+
     for i in range(0, len(all_chunks), batch_size):
+        print(f"Embedding batch {i//batch_size + 1}...")
         batch = all_chunks[i:i+batch_size]
-        embeddings = get_embeddings(batch)
-        all_embeddings.extend(embeddings)
+
+        try:
+            embeddings = get_embeddings(batch)
+            all_embeddings.extend(embeddings)
+        except Exception as e:
+            print("Embedding error:", e)
+            continue
+
+    if not all_embeddings:
+        print("ERROR: No embeddings generated. Please check the embedding model.")
+        return
 
     embedding_matrix = np.array(all_embeddings).astype("float32")
+    
+    if embedding_matrix.ndim != 2:
+        print(f"ERROR: Invalid embedding matrix shape {embedding_matrix.shape}. Expected 2D array.")
+        return
+    
     embedding_dim = embedding_matrix.shape[1]
 
     print("Building FAISS index...")
@@ -111,11 +142,12 @@ def ingest_data():
     index.add(embedding_matrix)
 
     faiss.write_index(index, FAISS_INDEX_PATH)
-    
+
     with open(METADATA_PATH, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     print("Ingestion complete. Vector DB saved.")
+
 
 if __name__ == "__main__":
     ingest_data()

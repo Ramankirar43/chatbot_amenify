@@ -1,18 +1,28 @@
 import os
 import json
 import faiss
-from openai import AsyncOpenAI
 import numpy as np
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+
+load_dotenv()
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "amenify.index")
 METADATA_PATH = os.path.join(DATA_DIR, "metadata.json")
-EMBEDDING_MODEL = "text-embedding-3-small"
-LLM_MODEL = "gpt-4o-mini"
-SIMILARITY_THRESHOLD = 1.0 # This threshold depends on distance metric. FlatL2 distance. L2 distance lower is better. Assuming threshold around 1.0-1.5
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+LLM_MODEL = "gemini-2.5-flash"  # Using latest available model
+SIMILARITY_THRESHOLD = 1.0
 
-# We need a synchronous client for simple embedding or reuse the async one
-aclient = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Configure Google Gemini
+api_key = os.getenv("GOOGLE_GEMINI_API_KEY")
+if api_key:
+    genai.configure(api_key=api_key)
+
+# Load embedding model
+print("Loading embedding model...")
+embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
 index = None
 metadata = []
@@ -27,18 +37,78 @@ def load_vector_db():
     else:
         print("WARNING: Vector DB files not found. Please run ingest.py first.")
 
-async def get_query_embedding(query: str) -> list[float]:
-    response = await aclient.embeddings.create(
-        input=[query],
-        model=EMBEDDING_MODEL
-    )
-    return response.data[0].embedding
+def list_available_models():
+    """Debug: List available Gemini models"""
+    try:
+        models = genai.list_models()
+        print("\n=== Available Gemini Models ===")
+        for model in models:
+            print(f"  - {model.name}")
+        print("================================\n")
+    except Exception as e:
+        print(f"Could not list models: {e}")
 
-async def retrieve_contexts(query: str, top_k: int = 3, threshold: float = 1.5):
+def get_query_embedding(query: str) -> list[float]:
+    embedding = embedding_model.encode(query, convert_to_tensor=False)
+    return embedding.tolist()
+
+def polish_response(contexts: list, query: str, max_lines: int = 5) -> str:
+    """Create a polished 5-line summary from retrieved contexts."""
+    if not contexts:
+        return "I don't know."
+    
+    # Extract key sentences from best matching context
+    best_context = contexts[0]['text'].strip()
+    
+    # Split into sentences and clean up
+    sentences = []
+    for sent in best_context.split('.'):
+        sent = sent.strip()
+        # Filter out very short or low-quality sentences
+        if len(sent) > 20 and not sent.endswith(('View', 'More', 'Know')):
+            sentences.append(sent)
+    
+    if not sentences:
+        # Fallback: use first 300 chars as one summary line
+        if len(best_context) > 200:
+            return best_context[:200].strip() + "..."
+        return best_context
+    
+    # Select up to 5 most relevant sentences
+    selected_sentences = sentences[:max_lines]
+    
+    # Join sentences and create polished response
+    polished_lines = []
+    for sent in selected_sentences:
+        # Clean up sentence
+        sent = sent.strip()
+        if sent and not sent.endswith('.'):
+            sent += '.'
+        if len(sent) > 5:  # Only add meaningful sentences
+            polished_lines.append(sent)
+    
+    if not polished_lines:
+        # Emergency fallback
+        return best_context[:250] + "..." if len(best_context) > 250 else best_context
+    
+    # Ensure we have max 5 lines
+    polished = "\n".join(polished_lines[:5])
+    
+    # Cap total length at 600 chars
+    if len(polished) > 600:
+        polished = polished[:600].rsplit('\n', 1)[0] + "."
+    
+    return polished
+
+def retrieve_contexts(query: str, top_k: int = 3, threshold: float = 1.5):
+    """Retrieve contexts with STRICT similarity threshold.
+    Lower l2 distance = higher similarity.
+    Threshold of 1.5 = only very relevant matches (strict mode).
+    If distance > 1.5, query is considered outside knowledge base."""
     if index is None or not metadata:
         return []
 
-    q_emb = await get_query_embedding(query)
+    q_emb = get_query_embedding(query)
     q_emb_matrix = np.array([q_emb]).astype("float32")
 
     # D is distances (L2), I is indices
@@ -47,53 +117,71 @@ async def retrieve_contexts(query: str, top_k: int = 3, threshold: float = 1.5):
     contexts = []
     for dist, idx in zip(distances[0], indices[0]):
         if idx != -1 and dist < threshold:
-            contexts.append(metadata[idx])
+            ctx = metadata[idx].copy()
+            ctx["distance"] = float(dist)
+            contexts.append(ctx)
+            print(f"Found context: distance={dist:.4f}, source={metadata[idx]['source'][:50]}")
+    
+    if not contexts:
+        print(f"No contexts found. Best match distance: {distances[0][0]:.4f} (threshold: {threshold})")
+    
     return contexts
 
 async def generate_chat_stream(query: str, chat_history: list):
     """
-    RAG Logic with Strict Anti-Hallucination
-    Returns an async generator yielding chunks of response.
+    RAG Logic with Strict Anti-Hallucination.
+    Only answers from knowledge base; responds 'I don't know' if no good match found.
     """
-    contexts = await retrieve_contexts(query)
+    contexts = retrieve_contexts(query)
     
     if not contexts:
+        print(f"Query '{query}' has no matching contexts")
         yield "I don't know."
         return
     
     # Build prompt
     context_text = "\n\n".join([f"Source: {ctx['source']}\nContent: {ctx['text']}" for ctx in contexts])
     
-    system_prompt = f"""You are an expert customer support agent for Amenify (an interior design and furnishing company).
-Your task is to answer user queries using ONLY the provided context below.
-If the answer cannot be deduced from the provided context, you MUST answer EXACTLY with "I don't know."
-Do NOT guess. Do NOT make up information.
-When you answer, briefly mention the source URL if applicable.
+    system_prompt = f"""You are a concise customer support agent for Amenify.
+Answer the user's query in EXACTLY 5 lines or less using ONLY the provided context.
+Be direct and informative. Do NOT explain or apologize.
+If you cannot answer from the context, respond with: "I don't know."
 
 <context>
 {context_text}
-</context>"""
+</context>
 
-    messages = [{"role": "system", "content": system_prompt}]
+User Query: {query}
+
+Remember: Answer in maximum 5 lines. Be concise and relevant only."""
     
-    # Append limited chat history (last 5 interactions)
-    for msg in chat_history[-5:]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
+    try:
+        model = genai.GenerativeModel(LLM_MODEL)
+        response = model.generate_content(
+            system_prompt,
+            stream=True,
+            generation_config=genai.types.GenerationConfig(temperature=0.0)
+        )
         
-    messages.append({"role": "user", "content": query})
-
-    stream = await aclient.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        temperature=0.0,
-        stream=True
-    )
-
-    sources = set([c['source'] for c in contexts])
-    source_attribution = f"\n\n*(Sources: {', '.join(sources)})*"
-
-    async for chunk in stream:
-        if chunk.choices[0].delta.content:
-            yield chunk.choices[0].delta.content
+        sources = set([c['source'] for c in contexts])
+        source_attribution = f"\n\n*(Sources: {', '.join(sources)})*"
+        
+        full_response = ""
+        for chunk in response:
+            if chunk.text:
+                full_response += chunk.text
+                yield chunk.text
+        
+        if full_response:
+            yield source_attribution
+    except Exception as e:
+        print(f"Error generating response: {e}")
+        # Fallback: Use polished response from context
+        if contexts:
+            polished = polish_response(contexts, query)
+            yield polished
             
-    yield source_attribution
+            source_list = sorted(set([c['source'] for c in contexts]))
+            yield f"\n\n*(Sources: {', '.join(source_list)})*"
+        else:
+            yield "I don't know."

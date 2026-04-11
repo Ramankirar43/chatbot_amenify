@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from retriever.rag import load_vector_db, generate_chat_stream
+from retriever.rag import load_vector_db, generate_chat_stream, list_available_models
 import os
 from dotenv import load_dotenv
 
@@ -31,6 +31,7 @@ class ChatRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     load_vector_db()
+    list_available_models()
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
