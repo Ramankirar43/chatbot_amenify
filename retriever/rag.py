@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import threading
+import asyncio
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,7 @@ SIMILARITY_THRESHOLD = 1.35
 MAX_CONTEXT_BLOCKS = 3
 FAISS_PROBE_K = 20
 LLM_MAX_OUTPUT_TOKENS = 420
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "25"))
 
 # Lazy-loaded heavy resources (nothing loaded at import time)
 _resources_lock = threading.Lock()
@@ -484,19 +486,28 @@ Question: {query}"""
     try:
         import google.generativeai as genai
 
-        model = genai.GenerativeModel(LLM_MODEL)
-        response = model.generate_content(
-            system_prompt,
-            stream=True,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.0,
-                max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
-            ),
+        def _generate_once() -> str:
+            model = genai.GenerativeModel(LLM_MODEL)
+            response = model.generate_content(
+                system_prompt,
+                stream=False,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0,
+                    max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
+                ),
+                request_options={"timeout": LLM_TIMEOUT_SECONDS},
+            )
+            return (getattr(response, "text", "") or "").strip()
+
+        text = await asyncio.wait_for(
+            asyncio.to_thread(_generate_once),
+            timeout=LLM_TIMEOUT_SECONDS + 3,
         )
 
-        for chunk in response:
-            if chunk.text:
-                yield chunk.text
+        if text:
+            yield text
+        else:
+            yield polish_response(contexts, query)
     except Exception as e:
         logger.exception("LLM generation failed")
         if contexts:
