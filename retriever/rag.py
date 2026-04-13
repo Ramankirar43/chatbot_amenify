@@ -32,6 +32,7 @@ _index: Any = None
 _metadata: list | None = None
 _resources_load_error: str | None = None
 _gemini_configured = False
+_preload_started = False
 
 
 def load_resources() -> str | None:
@@ -92,6 +93,29 @@ def load_resources() -> str | None:
             _metadata = None
             _resources_load_error = "The assistant could not start its search index. Please try again later."
             return _resources_load_error
+
+
+def is_resources_ready() -> bool:
+    return _embedding_model is not None and _index is not None and _metadata is not None
+
+
+def preload_resources_in_background() -> bool:
+    """
+    Kick off non-blocking resource preload once per process.
+    Returns True when a preload thread was started.
+    """
+    global _preload_started
+    with _resources_lock:
+        if _preload_started or is_resources_ready() or _resources_load_error is not None:
+            return False
+        _preload_started = True
+
+    def _runner():
+        load_resources()
+
+    t = threading.Thread(target=_runner, name="rag-preload", daemon=True)
+    t.start()
+    return True
 
 
 def get_query_embedding(query: str) -> list[float]:

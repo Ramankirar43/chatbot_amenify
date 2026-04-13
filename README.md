@@ -66,6 +66,7 @@ This application can be easily deployed to a cloud provider like Render, Railway
 
 - `render.yaml` is included, so Render can auto-detect build/start commands.
 - The API uses a lightweight `/health` probe and lazy-loads RAG resources only when needed.
+- Startup now begins a background RAG warmup (`PRELOAD_RAG_ON_STARTUP=true` by default) to reduce first-chat latency.
 - Keep `GOOGLE_GEMINI_API_KEY` configured in Render environment variables.
 
 ### Option 2: AWS Elastic Beanstalk (EB)

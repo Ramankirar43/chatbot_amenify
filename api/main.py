@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from retriever.rag import generate_chat_stream
+from retriever.rag import generate_chat_stream, preload_resources_in_background
 
 load_dotenv()
 
@@ -33,6 +33,17 @@ class ChatRequest(BaseModel):
 async def health():
     """Lightweight probe for Render/orchestrators; does not load ML resources."""
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+async def startup_warmup():
+    """
+    Start RAG resource preload in background so first user query is faster.
+    Disable with PRELOAD_RAG_ON_STARTUP=false.
+    """
+    preload_enabled = os.getenv("PRELOAD_RAG_ON_STARTUP", "true").strip().lower()
+    if preload_enabled in {"1", "true", "yes", "on"}:
+        preload_resources_in_background()
 
 
 @app.post("/chat")
