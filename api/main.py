@@ -64,7 +64,15 @@ async def chat_endpoint(req: ChatRequest):
         chat_sessions[req.session_id].append({"role": "user", "content": user_message})
         chat_sessions[req.session_id].append({"role": "assistant", "content": full_response})
 
-    return StreamingResponse(stream_wrapper(), media_type="text/plain")
+    return StreamingResponse(
+        stream_wrapper(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 _frontend_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")

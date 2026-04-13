@@ -40,9 +40,8 @@ async function sendMessage() {
             body: JSON.stringify({ session_id: sessionId, message: text })
         });
 
-        typingIndicator.style.display = 'none';
-
         if (!response.ok) {
+            typingIndicator.style.display = 'none';
             appendMessage('assistant', 'Sorry, I encountered an error. Please try again later.');
             return;
         }
@@ -52,17 +51,28 @@ async function sendMessage() {
         const decoder = new TextDecoder('utf-8');
         let done = false;
         
-        // Create an empty assistant message box to fill
-        const assistantMsgDiv = appendMessage('assistant', '');
+        // Create assistant message immediately so user sees progress
+        const assistantMsgDiv = appendMessage('assistant', 'Thinking...');
+        let firstChunkReceived = false;
 
         while (!done) {
             const { value, done: readerDone } = await reader.read();
             done = readerDone;
             if (value) {
+                if (!firstChunkReceived) {
+                    firstChunkReceived = true;
+                    typingIndicator.style.display = 'none';
+                    assistantMsgDiv.innerText = '';
+                }
                 const chunk = decoder.decode(value, { stream: true });
                 assistantMsgDiv.innerText += chunk;
                 chatBox.scrollTop = chatBox.scrollHeight;
             }
+        }
+
+        if (!firstChunkReceived) {
+            typingIndicator.style.display = 'none';
+            assistantMsgDiv.innerText = 'Sorry, I could not generate a response right now.';
         }
     } catch (err) {
         console.error(err);
