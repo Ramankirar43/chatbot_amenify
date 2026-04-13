@@ -30,13 +30,15 @@ GOOGLE_GEMINI_API_KEY="your-google-gemini-api-key"
 
 **Note:** Embeddings are generated locally using sentence-transformers, so no API key is needed for embeddings.
 
-### 3. Data Ingestion
+### 3. Data Ingestion (One-Time, Local)
 
-Run the ingestion script to scrape the provided Amenify URLs, create chunks, generate embeddings, and store them in the local `data/` directory.
+Run the ingestion script once (locally) to scrape the provided Amenify URLs, create chunks, generate embeddings, and store them in the local `data/` directory.
 
 ```bash
 python -m ingestion.ingest
 ```
+
+After ingestion, commit both `data/amenify.index` and `data/metadata.json` to GitHub so deployments can start immediately without running ingestion.
 
 ### 4. Run the API Server
 
@@ -54,11 +56,17 @@ This application can be easily deployed to a cloud provider like Render, Railway
 
 ### Option 1: Render / Railway (Recommended)
 
-1. **Prepare your repo**: Push this entire directory to a GitHub repository. Note that the `data/` folder contains your FAISS indices; while for small indices it can be checked into git, best practice is to rebuild it in the build step, or store it in S3. For simplicity, commit it if it's small, or add a build script that runs `python -m ingestion.ingest` before starting.
+1. **Prepare your repo**: Push this entire directory to GitHub, including `data/amenify.index` and `data/metadata.json`. This app is designed to read prebuilt data files on startup and should not run ingestion during Render deploys.
 2. **Setup on Render/Railway**: Create a new Web Service using the GitHub repository.
 3. **Environment setup**: Set `GOOGLE_GEMINI_API_KEY` in the environment variables menu.
-4. **Start Command**: Set the start command to: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
+4. **Start Command**: Use `uvicorn api.main:app --host 0.0.0.0 --port $PORT` (already defined in `render.yaml`).
 5. **Deploy**: Render/Railway will install the dependencies from `requirements.txt` and start the server.
+
+### Render Notes
+
+- `render.yaml` is included, so Render can auto-detect build/start commands.
+- The API uses a lightweight `/health` probe and lazy-loads RAG resources only when needed.
+- Keep `GOOGLE_GEMINI_API_KEY` configured in Render environment variables.
 
 ### Option 2: AWS Elastic Beanstalk (EB)
 
